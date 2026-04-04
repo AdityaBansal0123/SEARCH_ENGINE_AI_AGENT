@@ -1,111 +1,151 @@
+import math
+import re
 import streamlit as st
-from dotenv import load_dotenv
-
 from langchain_groq import ChatGroq
 from langchain_community.utilities import WikipediaAPIWrapper, ArxivAPIWrapper
 from langchain_community.tools import WikipediaQueryRun, ArxivQueryRun, DuckDuckGoSearchRun
-from langchain_classic.agents import initialize_agent, AgentType
-from langchain_classic.callbacks.streamlit import StreamlitCallbackHandler
-from langchain_classic.tools import Tool
-load_dotenv()
+from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
+from langchain.agents import create_react_agent, AgentExecutor
+from langchain_core.tools import Tool
+from langchain_core.prompts import PromptTemplate
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="LangChain Search Agent", page_icon="🔎")
-st.title("🔎 Smart Search Agent (Groq + LangChain)")
+# ──────────────────────────────────────────────
+# PAGE CONFIG
+# ──────────────────────────────────────────────
+st.set_page_config(page_title="Smart Search Agent", page_icon="🔎", layout="centered")
+st.title("🔎 Smart Search Agent")
+st.caption("Powered by Groq · LangChain · Wikipedia · Arxiv · DuckDuckGo")
 
-st.sidebar.title("Settings")
-api_key = st.sidebar.text_input("Enter your Groq API Key:", type="password")
+# ──────────────────────────────────────────────
+# SIDEBAR
+# ──────────────────────────────────────────────
+st.sidebar.title("⚙️ Settings")
+api_key = st.sidebar.text_input("Groq API Key", type="password", placeholder="gsk_...")
+model_name = st.sidebar.selectbox(
+    "Model",
+    ["llama-3.3-70b-versatile"],
+    index=0,  # Highly recommended to stick with Llama 3 70B for ReAct agents
+)
+max_iterations = st.sidebar.slider("Max Agent Iterations", 3, 15, 7)
+st.sidebar.markdown("---")
+if st.sidebar.button("🗑️ Clear Chat"):
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Hi 👋 Ask me anything!"}
+    ]
+    st.rerun()
 
-# ---------------- Tools ----------------
-
-wiki = WikipediaQueryRun(
-    api_wrapper=WikipediaAPIWrapper(top_k_results=1, doc_content_chars_max=500),
-    description="Use for general knowledge"
+# ──────────────────────────────────────────────
+# TOOLS
+# ──────────────────────────────────────────────
+wiki_tool = WikipediaQueryRun(
+    api_wrapper=WikipediaAPIWrapper(top_k_results=2, doc_content_chars_max=800),
+)
+wiki_tool.description = (
+    "Use Wikipedia for factual, encyclopedic information about people, places, "
+    "history, science, and concepts. Input: a concise search term."
 )
 
-arxiv = ArxivQueryRun(
-    api_wrapper=ArxivAPIWrapper(top_k_results=1, doc_content_chars_max=300),
-    description="Use for research papers"
+arxiv_tool = ArxivQueryRun(
+    api_wrapper=ArxivAPIWrapper(top_k_results=2, doc_content_chars_max=600),
+)
+arxiv_tool.description = (
+    "Use Arxiv to find academic/research papers. Input: a short topic or paper title."
 )
 
-search = DuckDuckGoSearchRun(
-    name="Search",
-    description="Use for latest information or current events"
+search_tool = DuckDuckGoSearchRun(name="DuckDuckGo")
+search_tool.description = (
+    "Use DuckDuckGo for current events, news, or recent information. Input: a search query."
 )
 
-def calculator_tool(expression: str) -> str:
-    try:
-        return str(eval(expression))
-    except Exception:
-        return "Invalid math expression"
+tools = [search_tool, arxiv_tool, wiki_tool]
 
-calculator = Tool(
-    name="Calculator",
-    func=calculator_tool,
-    description="Useful for solving math problems. Input should be a valid mathematical expression."
-)
+# ──────────────────────────────────────────────
+# REACT PROMPT
+# Required variables: {tools}, {tool_names}, {input}, {agent_scratchpad}
+# ──────────────────────────────────────────────
+# FIX APPLIED: Added explicit instruction to always output Action Input
+REACT_TEMPLATE = """You are a helpful, accurate assistant with access to tools.
 
-tools = [search, arxiv, wiki, calculator]
+Tools available:
+{tools}
 
-# ---------------- Session Memory ----------------
+RULES:
+- Use Calculator for ANY math or numerical computation — never calculate mentally.
+- Use Wikipedia for encyclopedic facts.
+- Use Arxiv for research papers.
+- Use DuckDuckGo for recent/news/web info.
+- YOU MUST ALWAYS provide an 'Action Input:' when using a tool. Do not just output the 'Action:'.
+
+Strictly follow this format — no deviations:
+
+Question: the input question you must answer
+Thought: reasoning about what to do
+Action: one of [{tool_names}]
+Action Input: input to the tool (plain text, no quotes, no JSON)
+Observation: result from the tool
+... (repeat Thought/Action/Action Input/Observation as needed)
+Thought: I now know the final answer
+Final Answer: the final answer to the original question
+
+Begin!
+
+Question: {input}
+Thought:{agent_scratchpad}"""
+
+react_prompt = PromptTemplate.from_template(REACT_TEMPLATE)
+
+# ──────────────────────────────────────────────
+# SESSION STATE
+# ──────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hi 👋 I can search the web, Arxiv, and Wikipedia. Ask me anything!"}
+        {"role": "assistant", "content": "Hi 👋 Ask me anything — I can search the web, Wikipedia, Arxiv, and solve math!"}
     ]
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# ---------------- User Input ----------------
-if prompt := st.chat_input("Ask anything..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    st.chat_message("user").write(prompt)
+# ──────────────────────────────────────────────
+# CHAT INPUT
+# ──────────────────────────────────────────────
+if user_input := st.chat_input("Ask anything…"):
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.chat_message("user").write(user_input)
 
     if not api_key:
-        st.warning("Please enter your Groq API key.")
+        st.warning("⚠️ Please enter your Groq API key in the sidebar.")
         st.stop()
 
-    # ---------------- LLM ----------------
     llm = ChatGroq(
         groq_api_key=api_key,
-        model_name="llama-3.3-70b-versatile",
+        model_name=model_name,
         streaming=True,
-        temperature=0
+        temperature=0,
     )
 
-    # ---------------- Agent ----------------
-    agent = initialize_agent(
+    react_agent = create_react_agent(llm=llm, tools=tools, prompt=react_prompt)
+
+    # FIX APPLIED: early_stopping_method changed to "force"
+    executor = AgentExecutor(
+        agent=react_agent,
         tools=tools,
-        llm=llm,
-        agent=AgentType.CHAT_ZERO_SHOT_REACT_DESCRIPTION,
-        handle_parsing_errors=True,   # ✅ prevents crash
         verbose=True,
-        max_iterations=9            # ✅ prevents infinite loops
+        handle_parsing_errors=True,
+        max_iterations=max_iterations,
+        early_stopping_method="force", 
+        return_intermediate_steps=False,
     )
 
-    # ---------------- Response ----------------
     with st.chat_message("assistant"):
-        st_cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
-
+        cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
         try:
-            response = agent.run(f"""
-                You are a strict ReAct agent.
-
-                Follow this EXACT format:
-
-                Thought: think step by step
-                Action: one of [{', '.join([tool.name for tool in tools])}]
-                Action Input: input to the tool
-
-                OR
-
-                Final Answer: your final answer
-
-                User Question: {prompt}
-                """,callbacks=[st_cb])
-
-        except Exception as e:
-            response = f"⚠️ Error: {str(e)}"
+            result = executor.invoke(
+                {"input": user_input},
+                config={"callbacks": [cb]},
+            )
+            response = result.get("output", "No response generated.")
+        except Exception as ex:
+            response = f"⚠️ Agent error: {ex}"
 
         st.session_state.messages.append({"role": "assistant", "content": response})
         st.write(response)
